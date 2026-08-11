@@ -1,3 +1,4 @@
-jinja2
-weasyprint
-pandas
+pandas>=1.3.0
+jinja2>=3.0.0
+matplotlib>=3.4.0
+weasyprint>=53.0
