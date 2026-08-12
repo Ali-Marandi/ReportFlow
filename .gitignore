@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Build outputs
+build/
+dist/
+*.spec
+build-output/
+
+# Local ReportFlow workspace and secrets
+.reportflow/
+*.db
+*.sqlite
+*.key
+*.pem
+.env
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

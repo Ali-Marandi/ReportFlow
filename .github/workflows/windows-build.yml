@@ -1,0 +1,60 @@
+name: Build ReportFlow for Windows
+
+on:
+  push:
+    branches: [main, develop, feature/**]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    name: Test and package on Windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run automated tests
+        run: pytest -q
+
+      - name: Audit Python dependencies
+        run: pip-audit -r requirements.txt
+        continue-on-error: true
+
+      - name: Package ReportFlow Desktop
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name ReportFlow --icon assets/reportflow.ico --add-data "assets;assets" reportflow.py
+
+      - name: Verify Windows executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/ReportFlow/ReportFlow.exe")) { throw "Windows executable was not produced." }
+          Get-FileHash "dist/ReportFlow/ReportFlow.exe" -Algorithm SHA256 | Format-List
+
+      - name: Archive Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReportFlow-Windows
+          path: dist/ReportFlow
+          if-no-files-found: error
+          retention-days: 14
