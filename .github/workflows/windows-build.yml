@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test-and-package:
@@ -39,22 +39,46 @@ jobs:
 
       - name: Audit Python dependencies
         run: pip-audit -r requirements.txt
-        continue-on-error: true
 
       - name: Package ReportFlow Desktop
         run: |
           pyinstaller --noconfirm --clean --windowed --name ReportFlow --icon assets/reportflow.ico --add-data "assets;assets" reportflow.py
+          Compress-Archive -Path "dist/ReportFlow/*" -DestinationPath "dist/ReportFlow-Windows.zip" -Force
 
-      - name: Verify Windows executable
+      - name: Verify Windows package
         shell: pwsh
         run: |
           if (-not (Test-Path "dist/ReportFlow/ReportFlow.exe")) { throw "Windows executable was not produced." }
+          if (-not (Test-Path "dist/ReportFlow-Windows.zip")) { throw "Release archive was not produced." }
           Get-FileHash "dist/ReportFlow/ReportFlow.exe" -Algorithm SHA256 | Format-List
+          Get-FileHash "dist/ReportFlow-Windows.zip" -Algorithm SHA256 | Format-List
 
       - name: Archive Windows application
         uses: actions/upload-artifact@v4
         with:
           name: ReportFlow-Windows
-          path: dist/ReportFlow
+          path: dist/ReportFlow-Windows.zip
           if-no-files-found: error
           retention-days: 14
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test-and-package
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated package
+        uses: actions/download-artifact@v5
+        with:
+          name: ReportFlow-Windows
+          path: release
+
+      - name: Create release and attach Windows package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create $env:TAG "release/ReportFlow-Windows.zip#ReportFlow Windows package" --repo $env:GITHUB_REPOSITORY --title "ReportFlow $env:TAG" --generate-notes
