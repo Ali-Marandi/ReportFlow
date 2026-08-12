@@ -1,38 +1,42 @@
-name: Build ReportFlow for Windows
+name: Build, sign, and publish ReportFlow for Windows
 
 on:
   push:
     branches: [main, develop, feature/**]
-    tags: ['v*']
+    tags: ['v2.*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
+# Read is the safe default. Jobs receive elevated permissions only where needed.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test-and-package:
-    name: Test and package on Windows
+    name: Test and package unsigned Windows candidate
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.2
         with:
           python-version: '3.11'
           cache: pip
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
+            requirements-enterprise.txt
 
-      - name: Install dependencies
+      - name: Install tested dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
+          pip install -r requirements-enterprise.txt
+          pip install cyclonedx-bom
 
       - name: Run automated tests
         run: pytest -q
@@ -40,45 +44,89 @@ jobs:
       - name: Audit Python dependencies
         run: pip-audit -r requirements.txt
 
+      - name: Build SBOM
+        run: cyclonedx-py environment --output-file dist/sbom.json
+
       - name: Package ReportFlow Desktop
         run: |
           pyinstaller --noconfirm --clean --windowed --name ReportFlow --icon assets/reportflow.ico --add-data "assets;assets" reportflow.py
-          Compress-Archive -Path "dist/ReportFlow/*" -DestinationPath "dist/ReportFlow-Windows.zip" -Force
 
-      - name: Verify Windows package
+      - name: Verify unsigned candidate contents
         shell: pwsh
         run: |
           if (-not (Test-Path "dist/ReportFlow/ReportFlow.exe")) { throw "Windows executable was not produced." }
-          if (-not (Test-Path "dist/ReportFlow-Windows.zip")) { throw "Release archive was not produced." }
+          if (-not (Test-Path "dist/sbom.json")) { throw "SBOM was not produced." }
           Get-FileHash "dist/ReportFlow/ReportFlow.exe" -Algorithm SHA256 | Format-List
-          Get-FileHash "dist/ReportFlow-Windows.zip" -Algorithm SHA256 | Format-List
 
-      - name: Archive Windows application
-        uses: actions/upload-artifact@v4
+      - name: Archive unsigned candidate for the protected signing job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ReportFlow-Windows
-          path: dist/ReportFlow-Windows.zip
+          name: reportflow-unsigned-${{ github.sha }}
+          path: |
+            dist/ReportFlow
+            dist/sbom.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
-  publish-release:
-    name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+  sign-attest-and-publish:
+    name: Sign, attest, and publish protected v2 release
+    if: startsWith(github.ref, 'refs/tags/v2.')
     needs: test-and-package
-    runs-on: windows-latest
+    # This environment must require a security approver and restrict access to production secrets.
+    environment: production-release
+    # The signing runner is a dedicated, private Windows host with a non-exportable HSM/KSP key.
+    runs-on: [self-hosted, windows, reportflow-signing]
+    timeout-minutes: 25
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - name: Download validated package
-        uses: actions/download-artifact@v5
+      - name: Check out signed release source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
         with:
-          name: ReportFlow-Windows
-          path: release
+          fetch-depth: 0
 
-      - name: Create release and attach Windows package
+      - name: Download immutable unsigned candidate
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: reportflow-unsigned-${{ github.sha }}
+          path: candidate
+
+      - name: Sign and verify executable
+        shell: pwsh
+        env:
+          SIGNING_MODE: ${{ vars.REPORTFLOW_SIGNING_MODE }}
+          CERTIFICATE_THUMBPRINT: ${{ secrets.REPORTFLOW_CERTIFICATE_THUMBPRINT }}
+          TIMESTAMP_URL: ${{ vars.REPORTFLOW_TIMESTAMP_URL }}
+          REPORTFLOW_PFX_BASE64: ${{ secrets.REPORTFLOW_TEST_PFX_BASE64 }}
+          REPORTFLOW_PFX_PASSWORD: ${{ secrets.REPORTFLOW_TEST_PFX_PASSWORD }}
+        run: |
+          if ($env:SIGNING_MODE -notin @('certificate-store', 'pfx')) { throw "Set REPORTFLOW_SIGNING_MODE to certificate-store (production) or pfx (test only)." }
+          if (-not $env:TIMESTAMP_URL) { throw "Set the protected REPORTFLOW_TIMESTAMP_URL variable." }
+          ./tools/sign-release.ps1 -ExecutablePath candidate/ReportFlow/ReportFlow.exe -SigningMode $env:SIGNING_MODE -CertificateThumbprint $env:CERTIFICATE_THUMBPRINT -TimestampUrl $env:TIMESTAMP_URL
+
+      - name: Create signed archive and checksum manifest
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path "candidate/ReportFlow/*" -DestinationPath "release/ReportFlow-Windows-${{ github.ref_name }}.zip" -Force
+          Copy-Item candidate/sbom.json release/sbom.cdx.json
+          $files = Get-ChildItem release -File | ForEach-Object { Get-FileHash $_.FullName -Algorithm SHA256 | Select-Object @{Name='File';Expression={$_.Path | Split-Path -Leaf}}, Algorithm, Hash }
+          $files | ConvertTo-Json | Set-Content release/SHA256SUMS.json -Encoding utf8
+          $signature = Get-AuthenticodeSignature candidate/ReportFlow/ReportFlow.exe
+          if ($signature.Status -ne 'Valid') { throw "Final Authenticode verification failed: $($signature.Status)." }
+
+      - name: Generate provenance attestation for signed archive
+        uses: actions/attest@1e69f48acb82d196a394da916b4c1698aa569d6 # v4.0.0
+        with:
+          subject-path: release/ReportFlow-Windows-${{ github.ref_name }}.zip
+          sbom-path: release/sbom.cdx.json
+
+      - name: Publish signed GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create $env:TAG "release/ReportFlow-Windows.zip#ReportFlow Windows package" --repo $env:GITHUB_REPOSITORY --title "ReportFlow $env:TAG" --generate-notes
+          gh release create $env:TAG release/ReportFlow-Windows-$env:TAG.zip#ReportFlow-Windows-$env:TAG.zip release/SHA256SUMS.json#SHA256SUMS.json release/sbom.cdx.json#sbom.cdx.json --repo $env:GITHUB_REPOSITORY --title "ReportFlow $env:TAG" --generate-notes --verify-tag

@@ -6,9 +6,11 @@ not execute arbitrary SQL or let an LLM access credentials or raw data.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import shutil
 import smtplib
+import socket
 import sqlite3
 import ssl
 import urllib.parse
@@ -23,11 +25,12 @@ from uuid import uuid4
 import pandas as pd
 
 from reportflow_app.core import CredentialVault, ProjectStore, ReportDefinition, ReportFlowError, ReportRenderer, safe_file_stem, utc_now
+from reportflow_app.secrets import SecretProvider
 
 
 ALLOWED_AGGREGATIONS = {"sum", "average", "count", "distinct_count", "min", "max"}
 ALLOWED_CONNECTOR_KINDS = {"csv", "excel", "sqlite", "postgresql", "sqlserver", "rest_json"}
-FORBIDDEN_SQL_TOKENS = {"alter", "attach", "create", "delete", "detach", "drop", "insert", "pragma", "replace", "update", "vacuum"}
+FORBIDDEN_SQL_TOKENS = {"alter", "attach", "call", "copy", "create", "delete", "detach", "drop", "exec", "execute", "grant", "insert", "into", "load", "merge", "pragma", "replace", "revoke", "truncate", "update", "vacuum"}
 
 
 @dataclass(slots=True)
@@ -329,10 +332,12 @@ class Connector(Protocol):
 class ConnectorRegistry:
     """Instantiates trusted, read-only connector implementations by kind."""
 
-    def __init__(self) -> None:
+    def __init__(self, secret_provider: SecretProvider | None = None) -> None:
+        self.secret_provider = secret_provider
         self._connectors: dict[str, Connector] = {
             "csv": FileConnector("csv"), "excel": FileConnector("excel"), "sqlite": SQLiteConnector(),
-            "postgresql": PostgreSQLConnector(), "sqlserver": SQLServerConnector(), "rest_json": RestJsonConnector(),
+            "postgresql": PostgreSQLConnector(secret_provider), "sqlserver": SQLServerConnector(secret_provider),
+            "rest_json": RestJsonConnector(secret_provider),
         }
 
     def load(self, profile: ConnectorProfile) -> pd.DataFrame:
@@ -348,7 +353,12 @@ class FileConnector:
         self.kind = kind
 
     def load(self, profile: ConnectorProfile) -> pd.DataFrame:
-        path = Path(str(profile.settings.get("path", ""))).expanduser()
+        path = Path(str(profile.settings.get("path", ""))).expanduser().resolve()
+        allowed_root = str(profile.settings.get("allowed_root", "")).strip()
+        if allowed_root:
+            root = Path(allowed_root).expanduser().resolve()
+            if root not in path.parents and path != root:
+                raise ReportFlowError("The file connector path is outside its approved source directory.")
         if not path.exists() or not path.is_file():
             raise ReportFlowError("The configured file connector path cannot be found.")
         try:
@@ -377,13 +387,16 @@ class SQLiteConnector:
 
 
 class PostgreSQLConnector:
+    def __init__(self, secret_provider: SecretProvider | None = None) -> None:
+        self.secret_provider = secret_provider
+
     def load(self, profile: ConnectorProfile) -> pd.DataFrame:
         validate_read_only_query(str(profile.settings.get("query", "")))
         try:
             import psycopg  # type: ignore[import-not-found]
         except ImportError as error:
             raise ReportFlowError("PostgreSQL support requires the optional 'psycopg[binary]' enterprise dependency.") from error
-        secret = require_secret(profile)
+        secret = require_secret(profile, self.secret_provider)
         settings = profile.settings
         try:
             with psycopg.connect(
@@ -397,18 +410,23 @@ class PostgreSQLConnector:
 
 
 class SQLServerConnector:
+    def __init__(self, secret_provider: SecretProvider | None = None) -> None:
+        self.secret_provider = secret_provider
+
     def load(self, profile: ConnectorProfile) -> pd.DataFrame:
         validate_read_only_query(str(profile.settings.get("query", "")))
         try:
             import pyodbc  # type: ignore[import-not-found]
         except ImportError as error:
             raise ReportFlowError("SQL Server support requires the optional 'pyodbc' enterprise dependency.") from error
-        secret = require_secret(profile)
+        secret = require_secret(profile, self.secret_provider)
         settings = profile.settings
-        driver = settings.get("driver", "ODBC Driver 18 for SQL Server")
+        driver = str(settings.get("driver", "ODBC Driver 18 for SQL Server"))
+        if not driver.startswith("ODBC Driver ") or not driver.endswith(" for SQL Server") or ";" in driver:
+            raise ReportFlowError("SQL Server connector driver is not in the approved ODBC Driver family.")
         connection_string = (
             f"DRIVER={{{driver}}};SERVER={settings['server']};DATABASE={settings['database']};UID={settings['username']};"
-            f"PWD={secret};Encrypt=yes;TrustServerCertificate=no;Connection Timeout={int(settings.get('connect_timeout', 10))};"
+            f"PWD={secret};Encrypt=yes;TrustServerCertificate=no;ApplicationIntent=ReadOnly;Connection Timeout={bounded_timeout(settings.get('connect_timeout', 10))};"
         )
         try:
             with pyodbc.connect(connection_string, readonly=True) as connection:
@@ -420,20 +438,24 @@ class SQLServerConnector:
 class RestJsonConnector:
     MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
+    def __init__(self, secret_provider: SecretProvider | None = None) -> None:
+        self.secret_provider = secret_provider
+
     def load(self, profile: ConnectorProfile) -> pd.DataFrame:
         url = str(profile.settings.get("url", "")).strip()
-        parsed = urllib.parse.urlparse(url)
-        allowed_hosts = set(profile.settings.get("allowed_hosts", []))
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise ReportFlowError("REST connectors require an HTTPS endpoint.")
-        if not allowed_hosts or parsed.hostname not in allowed_hosts:
-            raise ReportFlowError("The REST endpoint is not present in this connector's approved host allowlist.")
+        parsed = urllib.parse.urlsplit(url)
+        raw_hosts = profile.settings.get("allowed_hosts", [])
+        if not isinstance(raw_hosts, list) or not raw_hosts:
+            raise ReportFlowError("REST connectors require a nonempty approved host allowlist.")
+        allowed_hosts = {str(host).lower() for host in raw_hosts}
+        validate_rest_endpoint(parsed, allowed_hosts, profile.settings.get("allowed_private_cidrs", []))
         headers = {"Accept": "application/json"}
         if profile.credential_reference:
-            headers[str(profile.settings.get("auth_header", "Authorization"))] = str(profile.settings.get("auth_prefix", "Bearer ")) + require_secret(profile)
+            headers[str(profile.settings.get("auth_header", "Authorization"))] = str(profile.settings.get("auth_prefix", "Bearer ")) + require_secret(profile, self.secret_provider)
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=int(profile.settings.get("timeout_seconds", 15))) as response:
+            opener = urllib.request.build_opener(NoRedirectHandler())
+            with opener.open(request, timeout=bounded_timeout(profile.settings.get("timeout_seconds", 15))) as response:
                 content_type = response.headers.get_content_type()
                 if content_type not in {"application/json", "text/json"}:
                     raise ReportFlowError("The REST connector response is not JSON.")
@@ -572,16 +594,17 @@ class SecureFolderDestination:
 class SMTPDestination:
     """Optional production adapter. Sending requires explicit approval at execute time."""
 
-    def __init__(self, host: str, port: int, username: str, credential_reference: str, sender: str, use_starttls: bool = True) -> None:
+    def __init__(self, host: str, port: int, username: str, credential_reference: str, sender: str, use_starttls: bool = True, secret_provider: SecretProvider | None = None) -> None:
         self.host, self.port, self.username = host, port, username
         self.credential_reference, self.sender, self.use_starttls = credential_reference, sender, use_starttls
+        self.secret_provider = secret_provider
 
     def deliver(self, recipient: BurstRecipient, artifacts: list[Path], dry_run: bool) -> list[str]:
         if dry_run:
             return [str(path) for path in artifacts]
-        password = CredentialVault.get_secret(self.credential_reference)
+        password = self.secret_provider.resolve(self.credential_reference) if self.secret_provider else CredentialVault.get_secret(self.credential_reference)
         if not password:
-            raise ReportFlowError("The approved SMTP credential cannot be found in the operating-system vault.")
+            raise ReportFlowError("The approved SMTP credential cannot be resolved by the configured secret provider.")
         message = EmailMessage()
         message["From"], message["To"] = self.sender, recipient.delivery_address
         message["Subject"] = f"ReportFlow delivery for {recipient.display_name}"
@@ -653,19 +676,19 @@ def validate_connector_profile(profile: ConnectorProfile) -> ConnectorProfile:
     return profile
 
 
-def require_secret(profile: ConnectorProfile) -> str:
+def require_secret(profile: ConnectorProfile, secret_provider: SecretProvider | None = None) -> str:
     if not profile.credential_reference:
-        raise ReportFlowError("This connector requires a credential reference stored in the operating-system vault.")
-    secret = CredentialVault.get_secret(profile.credential_reference)
+        raise ReportFlowError("This connector requires a credential reference resolved by an approved secret provider.")
+    secret = secret_provider.resolve(profile.credential_reference) if secret_provider else CredentialVault.get_secret(profile.credential_reference)
     if not secret:
-        raise ReportFlowError("The credential reference cannot be resolved by the operating-system vault.")
+        raise ReportFlowError("The credential reference cannot be resolved by the configured secret provider.")
     return secret
 
 
 def validate_read_only_query(query: str) -> None:
     normalized = " ".join(query.lower().split())
-    if not normalized.startswith(("select ", "with ")) or ";" in normalized:
-        raise ReportFlowError("Connectors accept a single read-only SELECT/CTE query only.")
+    if not normalized.startswith(("select ", "with ")) or ";" in normalized or "--" in normalized or "/*" in normalized or "*/" in normalized:
+        raise ReportFlowError("Connectors accept a single read-only SELECT/CTE query only; comments and multiple statements are prohibited.")
     tokens = set(normalized.replace("(", " ").replace(")", " ").replace(",", " ").split())
     if tokens.intersection(FORBIDDEN_SQL_TOKENS):
         raise ReportFlowError("The query contains a prohibited data-changing SQL keyword.")
@@ -714,3 +737,47 @@ def burst_definition_from_payload(payload: dict[str, Any]) -> BurstDefinition:
         approval_required=bool(payload.get("approval_required", True)), enabled=bool(payload.get("enabled", True)),
         created_at=payload.get("created_at", ""), updated_at=payload.get("updated_at", ""),
     )
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail closed on redirect so an approved URL cannot pivot to an internal host."""
+
+    def redirect_request(self, request, fp, code, message, headers, newurl):  # type: ignore[no-untyped-def]
+        raise ReportFlowError("REST connector redirects are not permitted by policy.")
+
+
+def bounded_timeout(value: object, minimum: int = 1, maximum: int = 60) -> int:
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as error:
+        raise ReportFlowError("Connector timeout must be an integer number of seconds.") from error
+    if not minimum <= timeout <= maximum:
+        raise ReportFlowError(f"Connector timeout must be between {minimum} and {maximum} seconds.")
+    return timeout
+
+
+def validate_rest_endpoint(parsed: urllib.parse.SplitResult, allowed_hosts: set[str], allowed_private_cidrs: object) -> None:
+    """Validate endpoint scheme, host and resolved address before connecting.
+
+    Public hosts are accepted only when explicitly allowlisted. Private, loopback,
+    link-local and reserved addresses require an additional CIDR allowlist, which
+    makes private enterprise endpoints possible without enabling generic SSRF.
+    """
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ReportFlowError("REST connectors require a clean HTTPS endpoint.")
+    if hostname not in allowed_hosts:
+        raise ReportFlowError("The REST endpoint is not present in this connector's approved host allowlist.")
+    if not isinstance(allowed_private_cidrs, list):
+        raise ReportFlowError("REST connector private CIDR allowlist must be a list.")
+    try:
+        private_networks = [ipaddress.ip_network(str(item), strict=False) for item in allowed_private_cidrs]
+        addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
+    except (OSError, ValueError) as error:
+        raise ReportFlowError("REST endpoint hostname could not be resolved safely.") from error
+    if not addresses:
+        raise ReportFlowError("REST endpoint hostname did not resolve to an address.")
+    for address in addresses:
+        is_private_target = address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_unspecified
+        if is_private_target and not any(address in network for network in private_networks):
+            raise ReportFlowError("REST endpoint resolves to an unapproved private or reserved network address.")

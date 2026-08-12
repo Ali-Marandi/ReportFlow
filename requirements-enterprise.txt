@@ -9,3 +9,18 @@ psycopg[binary]>=3.1
 
 # Microsoft SQL Server read-only connector. A system ODBC driver is also required.
 pyodbc>=5.0
+
+# SSO via OIDC Authorization Code + PKCE and ID-token signature validation.
+PyJWT[crypto]>=2.10
+
+# SCIM control-plane adapter; deploy server-side only, never inside the desktop executable.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Central secret-manager adapters. Install only the provider approved for a tenant.
+azure-identity>=1.19
+azure-keyvault-secrets>=4.9
+boto3>=1.35
+
+# Optional: enterprise security and SBOM tooling for local release rehearsals.
+cyclonedx-bom>=5.1
