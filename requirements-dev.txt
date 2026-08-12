@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0,<9.0
+PyInstaller>=6.10,<7.0
+pip-audit>=2.8,<3.0
