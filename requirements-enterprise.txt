@@ -1,0 +1,11 @@
+# Optional dependencies for ReportFlow v2.0 Enterprise Foundations.
+# Install only the integrations that are approved for the target deployment.
+
+# Governed AI Copilot through an OpenAI-compatible private or managed endpoint.
+openai>=1.0
+
+# PostgreSQL read-only connector.
+psycopg[binary]>=3.1
+
+# Microsoft SQL Server read-only connector. A system ODBC driver is also required.
+pyodbc>=5.0

@@ -77,6 +77,38 @@ pip-audit -r requirements.txt
 
 سند [Commercial Roadmap](docs/COMMERCIAL_ROADMAP.md) شکاف با ابزارهای Enterprise، قابلیت‌های اولویت‌دار، معماری هدف، مدل تجاری و معیارهای پذیرش release را شرح می‌دهد. قابلیت‌های آینده شامل connectorهای سازمانی، report bursting، SSO/SCIM، worker مرکزی، semantic layer، workflow تأیید، embedded analytics، AI copilot با حاکمیت و supply-chain hardening هستند.
 
+## پایه‌های Enterprise v2.0
+
+شاخهٔ توسعهٔ v2.0 قراردادهای قابل‌آزمون برای semantic metrics، connectorهای سازمانی، Report Bursting و AI Copilot حاکمیت‌شده را اضافه می‌کند. این قابلیت‌ها هنوز به‌معنای آماده‌بودن کامل برای محیط production چندمستاجری نیستند؛ SSO/SCIM، database RLS، secrets manager مرکزی، security review و کانال‌های تحویل سازمانی باید پیش از rollout فعال شوند.
+
+| قابلیت | وضعیت پایهٔ کد | کنترل کلیدی |
+|---|---|---|
+| Semantic Layer | مدل versioned برای dimension، metric، synonym، owner و lineage | aggregation قطعی و filterهای allowlisted |
+| Connector Registry | CSV/Excel، SQLite، REST JSON و adapter اختیاری PostgreSQL/SQL Server | read-only query، HTTPS/host allowlist، timeout و credential reference |
+| Report Bursting | mapping گیرنده به filter، dry-run پیش‌فرض و secure-folder delivery | approval صریح برای تحویل خارجی و audit هر اجرا |
+| AI Copilot | grounding بر مبنای semantic metadata و metric result | عدم دسترسی LLM به raw data/secret، citation اجباری و human review |
+
+وابستگی‌های Enterprise در فایل جداگانه قرار گرفته‌اند تا deployment تنها connectorهای مورد تأیید خود را نصب کند:
+
+```bash
+pip install -r requirements-enterprise.txt
+```
+
+برای نمونهٔ برنامه‌نویسی، ابتدا یک `ProjectStore` و سپس `EnterpriseCatalog` بسازید؛ `ConnectorProfile` تنها settings غیرحساس و `credential_reference` را نگهداری می‌کند. هر password یا token باید از طریق `CredentialVault` ذخیره و فقط در runtime resolve شود. برای اجرای burst، ابتدا `dry_run=True` را اجرا کنید؛ ارسال SMTP صرفاً با `approved=True` و credential موجود در vault مجاز است.
+
+```python
+from pathlib import Path
+from reportflow_app.core import ProjectStore
+from reportflow_app.enterprise import EnterpriseCatalog, ReportBurstService, SecureFolderDestination
+
+store = ProjectStore(Path.home() / ".reportflow" / "reportflow.db")
+catalog = EnterpriseCatalog(store)
+service = ReportBurstService(catalog, store, Path.home() / ".reportflow" / "exports")
+# service.execute(burst_definition, data, SecureFolderDestination(Path("approved-delivery")), dry_run=True)
+```
+
+جزئیات طراحی در [V2 Enterprise Architecture](docs/V2_ENTERPRISE_ARCHITECTURE.md) و برنامهٔ کسب‌وکار در [Enterprise GTM Strategy](docs/ENTERPRISE_GTM_STRATEGY.md) موجود است.
+
 ## مجوز
 
 **Proprietary — All rights reserved.** استفاده، توزیع یا بهره‌برداری تجاری از این کد نیازمند مجوز کتبی مالک مخزن است.
