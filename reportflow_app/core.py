@@ -510,7 +510,10 @@ class ReportScheduler:
     def __init__(self, store: ProjectStore, service: ReportService) -> None:
         self.store = store
         self.service = service
-        self.scheduler = BackgroundScheduler(timezone=str(datetime.now().astimezone().tzinfo))
+        # Let APScheduler select the host's local timezone. Converting the Windows
+        # timezone display name to a string can produce a non-IANA value such as
+        # "Coordinated Universal Time", which is not portable across runners.
+        self.scheduler = BackgroundScheduler()
 
     def start(self) -> None:
         if not self.scheduler.running:
