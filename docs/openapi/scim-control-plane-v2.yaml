@@ -1,0 +1,297 @@
+openapi: 3.1.0
+info:
+  title: ReportFlow SCIM Control Plane
+  version: 2.0.0
+  description: |
+    Server-side, tenant-scoped SCIM control-plane API for ReportFlow Enterprise.
+    Deploy only behind TLS, an API gateway, and a centrally managed bearer-token or mTLS policy.
+servers:
+  - url: https://reportflow-control.example/scim/v2
+security:
+  - bearerAuth: []
+paths:
+  /ServiceProviderConfig:
+    get:
+      operationId: getServiceProviderConfig
+      summary: Discover implemented SCIM capabilities
+      responses:
+        '200':
+          description: SCIM service provider configuration
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ServiceProviderConfig'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /Users:
+    get:
+      operationId: listUsers
+      summary: List provisioned users
+      parameters:
+        - $ref: '#/components/parameters/StartIndex'
+        - $ref: '#/components/parameters/Count'
+      responses:
+        '200':
+          description: Paginated SCIM User resources
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/UserList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: upsertUser
+      summary: Create or synchronize a SCIM user
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/UserRequest'
+      responses:
+        '201':
+          description: User provisioned
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/InvalidValue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /Users/{id}:
+    get:
+      operationId: getUser
+      summary: Retrieve one SCIM user
+      parameters:
+        - $ref: '#/components/parameters/ScimId'
+      responses:
+        '200':
+          description: User resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NoTarget'
+    patch:
+      operationId: patchUser
+      summary: Update allowlisted user properties
+      description: Only active, displayName, and emails may be changed. Role, id, and externalId updates are rejected.
+      parameters:
+        - $ref: '#/components/parameters/ScimId'
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/PatchRequest'
+      responses:
+        '200':
+          description: Updated user resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/InvalidValue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NoTarget'
+  /Groups:
+    post:
+      operationId: upsertGroup
+      summary: Create or synchronize a SCIM group
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/GroupRequest'
+      responses:
+        '201':
+          description: Group provisioned
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/InvalidValue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: SCIM provisioning token
+  parameters:
+    ScimId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        maxLength: 256
+    StartIndex:
+      name: startIndex
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    Count:
+      name: count
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 100
+  responses:
+    Unauthorized:
+      description: Missing or invalid provisioning identity
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            example: Bearer
+    InvalidValue:
+      description: Invalid or protected SCIM property
+      content:
+        application/scim+json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NoTarget:
+      description: Requested resource does not exist in this tenant
+      content:
+        application/scim+json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    ServiceProviderConfig:
+      type: object
+      required: [schemas, patch, bulk, filter, changePassword, sort]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        patch: {$ref: '#/components/schemas/SupportFlag'}
+        bulk: {$ref: '#/components/schemas/SupportFlag'}
+        filter: {$ref: '#/components/schemas/SupportFlag'}
+        changePassword: {$ref: '#/components/schemas/SupportFlag'}
+        sort: {$ref: '#/components/schemas/SupportFlag'}
+    SupportFlag:
+      type: object
+      required: [supported]
+      properties:
+        supported: {type: boolean}
+    UserRequest:
+      type: object
+      required: [externalId, userName]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        externalId: {type: string, maxLength: 256}
+        userName: {type: string, maxLength: 256}
+        displayName: {type: string, maxLength: 256}
+        active: {type: boolean, default: true}
+        emails:
+          type: array
+          items: {$ref: '#/components/schemas/Email'}
+        groups:
+          type: array
+          items: {$ref: '#/components/schemas/GroupReference'}
+    User:
+      allOf:
+        - $ref: '#/components/schemas/UserRequest'
+        - type: object
+          required: [id, meta]
+          properties:
+            id: {type: string}
+            meta: {$ref: '#/components/schemas/Meta'}
+    UserList:
+      type: object
+      required: [schemas, totalResults, startIndex, itemsPerPage, Resources]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        totalResults: {type: integer}
+        startIndex: {type: integer}
+        itemsPerPage: {type: integer}
+        Resources:
+          type: array
+          items: {$ref: '#/components/schemas/User'}
+    Email:
+      type: object
+      required: [value]
+      properties:
+        value: {type: string, format: email}
+        primary: {type: boolean}
+    GroupReference:
+      type: object
+      properties:
+        value: {type: string}
+        display: {type: string}
+    GroupRequest:
+      type: object
+      required: [externalId, displayName]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        externalId: {type: string, maxLength: 256}
+        displayName: {type: string, maxLength: 256}
+        members:
+          type: array
+          items:
+            type: object
+            required: [value]
+            properties:
+              value: {type: string}
+    Group:
+      allOf:
+        - $ref: '#/components/schemas/GroupRequest'
+        - type: object
+          required: [id, meta]
+          properties:
+            id: {type: string}
+            meta: {$ref: '#/components/schemas/Meta'}
+    PatchRequest:
+      type: object
+      required: [schemas, Operations]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        Operations:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [op, path, value]
+            properties:
+              op: {type: string, enum: [replace, add]}
+              path: {type: string, enum: [active, displayName, emails]}
+              value: {}
+    Meta:
+      type: object
+      properties:
+        resourceType: {type: string}
+        version: {type: string}
+        lastModified: {type: string, format: date-time}
+    Error:
+      type: object
+      required: [schemas, status, detail]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        status: {type: string}
+        scimType: {type: string}
+        detail: {type: string}

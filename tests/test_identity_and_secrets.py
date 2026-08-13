@@ -9,11 +9,12 @@ from reportflow_app.core import ProjectStore, ReportFlowError
 from reportflow_app.enterprise import ConnectorProfile, require_secret, validate_read_only_query, validate_rest_endpoint
 from reportflow_app.identity import (
     IdentityStore,
+    LoopbackCallbackReceiver,
     NativeOIDCClient,
     OIDCProviderConfig,
     SCIMProvisioningService,
 )
-from reportflow_app.secrets import SecretResolver
+from reportflow_app.secrets import SecretResolver, VaultAppRoleProvider
 
 
 class FakeSecretProvider:
@@ -47,6 +48,30 @@ def test_oidc_rejects_insecure_non_loopback_redirect() -> None:
         OIDCProviderConfig(
             issuer="https://id.example.test", client_id="desktop", redirect_uri="http://app.example.test/callback"
         ).validate()
+
+
+def test_insecure_loopback_idp_requires_explicit_testing_flag() -> None:
+    with pytest.raises(ReportFlowError):
+        OIDCProviderConfig(
+            issuer="http://127.0.0.1:8180/realms/test", client_id="desktop",
+            redirect_uri="http://127.0.0.1:49152/oauth/callback",
+        ).validate()
+    OIDCProviderConfig(
+        issuer="http://127.0.0.1:8180/realms/test", client_id="desktop",
+        redirect_uri="http://127.0.0.1:49152/oauth/callback", allow_insecure_loopback_for_testing=True,
+    ).validate()
+
+
+def test_loopback_callback_accepts_exact_path_once() -> None:
+    receiver = LoopbackCallbackReceiver("http://127.0.0.1:49157/oauth/callback")
+    receiver.start()
+    try:
+        import requests
+        assert requests.get("http://127.0.0.1:49157/other", timeout=2).status_code == 404
+        assert requests.get("http://127.0.0.1:49157/oauth/callback?code=sample&state=sample", timeout=2).status_code == 200
+        assert receiver.wait_for_callback(timeout_seconds=2).endswith("code=sample&state=sample")
+    finally:
+        receiver.stop()
 
 
 def test_scim_provisioning_is_allowlisted_and_audited(tmp_path: Path) -> None:
@@ -104,3 +129,12 @@ def test_rest_private_address_requires_explicit_cidr_allowlist() -> None:
     with pytest.raises(ReportFlowError, match="private"):
         validate_rest_endpoint(endpoint, {"127.0.0.1"}, [])
     validate_rest_endpoint(endpoint, {"127.0.0.1"}, ["127.0.0.0/8"])
+
+
+def test_vault_reference_rejects_path_traversal_before_network_access() -> None:
+    provider = VaultAppRoleProvider(
+        vault_url="https://vault.example.test", mount="kv", allowed_path_prefix="reportflow/prod",
+        role_id="test-role", secret_id_loader=lambda: "short-lived-test-bootstrap",
+    )
+    with pytest.raises(ReportFlowError, match="invalid secret path"):
+        provider.resolve("vault:///reportflow/prod/../other#password")

@@ -109,6 +109,18 @@ service = ReportBurstService(catalog, store, Path.home() / ".reportflow" / "expo
 
 جزئیات طراحی در [V2 Enterprise Architecture](docs/V2_ENTERPRISE_ARCHITECTURE.md) و برنامهٔ کسب‌وکار در [Enterprise GTM Strategy](docs/ENTERPRISE_GTM_STRATEGY.md) موجود است.
 
+### مستندات عملیاتی v2.0
+
+| سند | کاربرد |
+|---|---|
+| [API Reference v2.0](docs/API_REFERENCE_v2.md) | قراردادهای SCIM control plane، OIDC Desktop، Secret Manager و connectorها |
+| [OpenAPI SCIM v2.0](docs/openapi/scim-control-plane-v2.yaml) | مشخصات ماشین‌خوان endpointهای SCIM برای gateway و IdP |
+| [Enterprise Admin Guide](docs/ENTERPRISE_ADMIN_GUIDE_v2.md) | راه‌اندازی tenant، SSO/SCIM، secrets، connectors، bursting، audit و Go-Live |
+| [Security Architecture](docs/V2_SECURITY_ARCHITECTURE.md) | مرزهای اعتماد، identity، secrets و supply-chain controls |
+| [Pentest & Connector Security Plan](docs/PENTEST_AND_CONNECTOR_SECURITY_PLAN.md) | دامنه، سناریوها و gateهای آزمون امنیت |
+| [Local Keycloak OIDC Test](docs/LOCAL_OIDC_INTEGRATION_TEST.md) | بازتولید سناریوی Keycloak loopback و Authorization Code + PKCE |
+| [Release Runbook](docs/V2_RELEASE_RUNBOOK.md) | امضای کد، HSM، protected environment و انتشار کنترل‌شده |
+
 ## مجوز
 
 **Proprietary — All rights reserved.** استفاده، توزیع یا بهره‌برداری تجاری از این کد نیازمند مجوز کتبی مالک مخزن است.

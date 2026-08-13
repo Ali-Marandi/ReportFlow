@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import Qt, QTime
-from PySide6.QtGui import QAction, QColor, QFont, QIcon
+from PySide6.QtCore import Qt, QTime, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -530,14 +530,9 @@ class ReportFlowWindow(QMainWindow):
             self.show_error(f"The operating-system vault could not store the credential: {error}")
 
     def open_export_folder(self) -> None:
-        import os
-        import subprocess
-        if sys.platform.startswith("win"):
-            os.startfile(EXPORT_DIRECTORY)  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.run(["open", str(EXPORT_DIRECTORY)], check=False)
-        else:
-            subprocess.run(["xdg-open", str(EXPORT_DIRECTORY)], check=False)
+        EXPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(EXPORT_DIRECTORY))):
+            self.statusBar().showMessage("The operating system could not open the export folder.", 6000)
 
     def refresh_all(self) -> None:
         reports = self.store.list_reports()

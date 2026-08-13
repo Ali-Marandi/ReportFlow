@@ -9,11 +9,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import queue
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,12 +49,13 @@ class OIDCProviderConfig:
     scopes: tuple[str, ...] = ("openid", "profile", "email")
     group_claim: str = "groups"
     allowed_algorithms: tuple[str, ...] = SAFE_OIDC_ALGORITHMS
+    allow_insecure_loopback_for_testing: bool = False
 
     def validate(self) -> None:
-        _require_https_url(self.issuer, "OIDC issuer")
-        _require_https_url(self.authorization_endpoint, "OIDC authorization endpoint", optional=True)
-        _require_https_url(self.token_endpoint, "OIDC token endpoint", optional=True)
-        _require_https_url(self.jwks_uri, "OIDC JWKS endpoint", optional=True)
+        _require_https_url(self.issuer, "OIDC issuer", allow_insecure_loopback=self.allow_insecure_loopback_for_testing)
+        _require_https_url(self.authorization_endpoint, "OIDC authorization endpoint", optional=True, allow_insecure_loopback=self.allow_insecure_loopback_for_testing)
+        _require_https_url(self.token_endpoint, "OIDC token endpoint", optional=True, allow_insecure_loopback=self.allow_insecure_loopback_for_testing)
+        _require_https_url(self.jwks_uri, "OIDC JWKS endpoint", optional=True, allow_insecure_loopback=self.allow_insecure_loopback_for_testing)
         redirect = urllib.parse.urlsplit(self.redirect_uri)
         is_loopback = redirect.scheme == "http" and redirect.hostname in {"127.0.0.1", "::1"}
         if not is_loopback and (redirect.scheme != "https" or not redirect.hostname):
@@ -74,6 +78,83 @@ class LoginTransaction:
 class LoginStart:
     authorization_url: str
     state: str
+
+
+class LoopbackCallbackReceiver:
+    """One-time listener for a registered localhost OIDC callback.
+
+    The receiver accepts exactly one GET callback on the configured IPv4/IPv6
+    loopback host and exact path. It renders no token data and closes after the
+    caller consumes or expires the result.
+    """
+
+    def __init__(self, redirect_uri: str) -> None:
+        parsed = urllib.parse.urlsplit(redirect_uri)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"} or not parsed.port or not parsed.path:
+            raise ReportFlowError("Loopback callback receiver requires an explicit http://127.0.0.1 or http://[::1] redirect URI with port and path.")
+        self.redirect_uri = redirect_uri
+        self._parsed = parsed
+        self._callbacks: queue.Queue[str] = queue.Queue(maxsize=1)
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._server:
+            return
+        receiver = self
+        expected_path = self._parsed.path
+
+        class CallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                incoming = urllib.parse.urlsplit(self.path)
+                if incoming.path != expected_path:
+                    self.send_error(404)
+                    return
+                try:
+                    receiver._callbacks.put_nowait(receiver.redirect_uri.split("?", 1)[0] + ("?" + incoming.query if incoming.query else ""))
+                except queue.Full:
+                    self.send_error(409)
+                    return
+                body = b"ReportFlow sign-in completed. You can return to the application."
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        self._server = ThreadingHTTPServer((self._parsed.hostname, self._parsed.port), CallbackHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever, name="reportflow-oidc-callback", daemon=True)
+        self._thread.start()
+
+    def wait_for_callback(self, timeout_seconds: int = 300) -> str:
+        if not self._server:
+            raise ReportFlowError("Start the loopback callback receiver before waiting for the OIDC response.")
+        try:
+            return self._callbacks.get(timeout=timeout_seconds)
+        except queue.Empty as error:
+            raise ReportFlowError("OIDC callback did not arrive before the login transaction expired.") from error
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def __enter__(self) -> "LoopbackCallbackReceiver":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.stop()
 
 
 @dataclass(slots=True)
@@ -104,7 +185,7 @@ class NativeOIDCClient:
 
     def discover(self) -> OIDCProviderConfig:
         discovery_url = self.config.issuer.rstrip("/") + "/.well-known/openid-configuration"
-        payload = _read_json(discovery_url, self.timeout_seconds)
+        payload = _read_json(discovery_url, self.timeout_seconds, self.config.allow_insecure_loopback_for_testing)
         issuer = str(payload.get("issuer", "")).rstrip("/")
         if issuer != self.config.issuer.rstrip("/"):
             raise ReportFlowError("OIDC discovery issuer does not match the configured issuer.")
@@ -118,6 +199,7 @@ class NativeOIDCClient:
             scopes=self.config.scopes,
             group_claim=self.config.group_claim,
             allowed_algorithms=self.config.allowed_algorithms,
+            allow_insecure_loopback_for_testing=self.config.allow_insecure_loopback_for_testing,
         )
         discovered.validate()
         self.config = discovered
@@ -161,7 +243,7 @@ class NativeOIDCClient:
         token_response = _post_form(self.config.token_endpoint, {
             "grant_type": "authorization_code", "code": code, "redirect_uri": self.config.redirect_uri,
             "client_id": self.config.client_id, "code_verifier": transaction.code_verifier,
-        }, self.timeout_seconds)
+        }, self.timeout_seconds, self.config.allow_insecure_loopback_for_testing)
         id_token = str(token_response.get("id_token", ""))
         access_token = str(token_response.get("access_token", ""))
         if not id_token or not access_token:
@@ -410,19 +492,27 @@ def has_permission(roles: list[str], permission: str) -> bool:
     return any(permission in ROLE_PERMISSIONS.get(role, frozenset()) for role in roles)
 
 
-def _require_https_url(value: str, label: str, optional: bool = False) -> None:
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request: object, fp: object, code: int, message: str, headers: object, newurl: str) -> None:
+        raise ReportFlowError("OIDC endpoint redirects are not permitted by policy.")
+
+
+def _require_https_url(value: str, label: str, optional: bool = False, allow_insecure_loopback: bool = False) -> None:
     if optional and not value:
         return
     parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ReportFlowError(f"{label} must be a clean HTTPS URL.")
+    local_test_url = allow_insecure_loopback and parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1"}
+    if (parsed.scheme != "https" and not local_test_url) or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ReportFlowError(f"{label} must be a clean HTTPS URL, except for explicitly enabled local loopback testing.")
 
 
-def _read_json(url: str, timeout_seconds: int) -> dict[str, Any]:
-    _require_https_url(url, "Identity endpoint")
+def _read_json(url: str, timeout_seconds: int, allow_insecure_loopback: bool = False) -> dict[str, Any]:
+    _require_https_url(url, "Identity endpoint", allow_insecure_loopback=allow_insecure_loopback)
     request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        # Endpoint URL is scheme/host validated and redirects are rejected.
+        with opener.open(request, timeout=timeout_seconds) as response:  # nosec B310
             if response.headers.get_content_type() != "application/json":
                 raise ReportFlowError("Identity endpoint did not return JSON.")
             return dict(json.loads(response.read(1024 * 1024).decode("utf-8")))
@@ -432,12 +522,14 @@ def _read_json(url: str, timeout_seconds: int) -> dict[str, Any]:
         raise ReportFlowError("Unable to query the identity provider discovery endpoint.") from error
 
 
-def _post_form(url: str, fields: dict[str, str], timeout_seconds: int) -> dict[str, Any]:
-    _require_https_url(url, "OIDC token endpoint")
+def _post_form(url: str, fields: dict[str, str], timeout_seconds: int, allow_insecure_loopback: bool = False) -> dict[str, Any]:
+    _require_https_url(url, "OIDC token endpoint", allow_insecure_loopback=allow_insecure_loopback)
     body = urllib.parse.urlencode(fields).encode("utf-8")
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        # Token endpoint is scheme/host validated and redirects are rejected.
+        with opener.open(request, timeout=timeout_seconds) as response:  # nosec B310
             return dict(json.loads(response.read(1024 * 1024).decode("utf-8")))
     except Exception as error:
         raise ReportFlowError("OIDC code exchange failed.") from error

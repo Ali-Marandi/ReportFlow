@@ -23,3 +23,6 @@ build-output/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Disposable local IdP runtime, test credentials, and local security evidence.
+.local-keycloak/

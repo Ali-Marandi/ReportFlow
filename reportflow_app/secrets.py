@@ -66,6 +66,8 @@ class VaultAppRoleProvider:
         if parsed.scheme != "vault" or parsed.netloc or not parsed.path or not parsed.fragment:
             raise ReportFlowError("Vault references use vault:///path/to/secret#field.")
         path = parsed.path.lstrip("/")
+        if not path or any(segment in {"", ".", ".."} for segment in path.split("/")):
+            raise ReportFlowError("Vault reference contains an invalid secret path.")
         if not path.startswith(self.allowed_path_prefix.rstrip("/") + "/"):
             raise ReportFlowError("Vault reference is outside the approved tenant secret prefix.")
         secret_id = self.secret_id_loader()
@@ -80,7 +82,9 @@ class VaultAppRoleProvider:
         request = urllib.request.Request(self.vault_url.rstrip("/") + f"/v1/{urllib.parse.quote(self.mount, safe='')}/data/{path_url}",
                                          headers={"X-Vault-Token": token, "Accept": "application/json"}, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            # Vault URL and tenant path are validated; redirects are rejected.
+            with opener.open(request, timeout=self.timeout_seconds) as response:  # nosec B310
                 payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
         except Exception as error:
             raise ReportFlowError("Central Vault secret retrieval failed.") from error
@@ -171,6 +175,11 @@ class SecretResolver:
         return provider.resolve(reference)
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request: object, fp: object, code: int, message: str, headers: object, newurl: str) -> None:
+        raise ReportFlowError("Secret manager endpoint redirects are not permitted by policy.")
+
+
 def _validate_https(value: str, label: str) -> None:
     parsed = urllib.parse.urlsplit(value)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -181,7 +190,9 @@ def _post_json(url: str, body: dict[str, Any], timeout_seconds: int) -> dict[str
     payload = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        # URL is derived from validated Vault base URL; redirects are rejected.
+        with opener.open(request, timeout=timeout_seconds) as response:  # nosec B310
             return dict(json.loads(response.read(1024 * 1024).decode("utf-8")))
     except Exception as error:
         raise ReportFlowError("Central Vault authentication failed.") from error
