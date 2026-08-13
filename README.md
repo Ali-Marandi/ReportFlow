@@ -120,6 +120,9 @@ service = ReportBurstService(catalog, store, Path.home() / ".reportflow" / "expo
 | [Pentest & Connector Security Plan](docs/PENTEST_AND_CONNECTOR_SECURITY_PLAN.md) | دامنه، سناریوها و gateهای آزمون امنیت |
 | [Local Keycloak OIDC Test](docs/LOCAL_OIDC_INTEGRATION_TEST.md) | بازتولید سناریوی Keycloak loopback و Authorization Code + PKCE |
 | [Release Runbook](docs/V2_RELEASE_RUNBOOK.md) | امضای کد، HSM، protected environment و انتشار کنترل‌شده |
+| [v2.1 Product Architecture & GTM](docs/V21_PRODUCT_ARCHITECTURE_AND_GTM.md) | Report Bursting، connectorهای پیشرفته، Semantic Layer، AI Copilot و برنامهٔ GTM 180روزه |
+| [v2.1 Implementation Guide](docs/V21_IMPLEMENTATION_GUIDE.md) | پیکربندی عملی connector policy، recipient mapping، manifest و Copilot evidence |
+| [v2.1 Research Sources](docs/V21_RESEARCH_SOURCES.md) | منابع رسمی طراحی semantic، delivery، connector security و GTM |
 
 ## مجوز
 

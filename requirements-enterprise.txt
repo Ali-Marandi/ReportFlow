@@ -24,3 +24,8 @@ boto3>=1.35
 
 # Optional: enterprise security and SBOM tooling for local release rehearsals.
 cyclonedx-bom>=5.1
+
+# v2.1 advanced database connectors. Install only the approved vendor driver.
+mysql-connector-python>=9.0
+snowflake-connector-python>=3.12
+databricks-sql-connector>=4.0
