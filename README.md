@@ -123,6 +123,9 @@ service = ReportBurstService(catalog, store, Path.home() / ".reportflow" / "expo
 | [v2.1 Product Architecture & GTM](docs/V21_PRODUCT_ARCHITECTURE_AND_GTM.md) | Report Bursting، connectorهای پیشرفته، Semantic Layer، AI Copilot و برنامهٔ GTM 180روزه |
 | [v2.1 Implementation Guide](docs/V21_IMPLEMENTATION_GUIDE.md) | پیکربندی عملی connector policy، recipient mapping، manifest و Copilot evidence |
 | [v2.1 Research Sources](docs/V21_RESEARCH_SOURCES.md) | منابع رسمی طراحی semantic، delivery، connector security و GTM |
+| [v2.2 Architecture & Operations](docs/V22_ARCHITECTURE_AND_OPERATIONS.md) | صف مرکزی، retry/DLQ، مقصدهای object storage، portal و anomaly detection |
+| [v2.2 Research Sources](docs/V22_RESEARCH_SOURCES.md) | منابع رسمی integrity ذخیره‌سازی و isolation چندمستاجره |
+| [Release Automation](tools/release-v21.sh) | dry-run محلی و انتشار کنترل‌شدهٔ v2.1 با gate صریح |
 
 ## مجوز
 

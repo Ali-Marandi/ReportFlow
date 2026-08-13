@@ -29,3 +29,6 @@ cyclonedx-bom>=5.1
 mysql-connector-python>=9.0
 snowflake-connector-python>=3.12
 databricks-sql-connector>=4.0
+
+# v2.2 approved artifact destinations. Credentials are resolved by workload identity, not files.
+azure-storage-blob>=12.24
