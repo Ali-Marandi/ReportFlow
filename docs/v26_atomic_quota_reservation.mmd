@@ -1,0 +1,18 @@
+flowchart LR
+    A[Authenticated submitter] --> B[Transactional commercial-distribution service]
+    B --> C{Entitlement + feature gate}
+    C -->|Denied| D[Explainable rejection + audit]
+    C -->|Allowed| E[Lock quota bucket]
+    E --> F{Idempotency key / job exists?}
+    F -->|Yes| G[Return same reservation and job]
+    F -->|No| H{Consumed + held + quantity <= limit?}
+    H -->|Deny overage| I[Quota rejection + audit]
+    H -->|Allow| J[Insert HELD reservation]
+    J --> K[Insert distribution job + outbox in same transaction]
+    K --> L[Queue worker]
+    L -->|Success| M[Atomically HELD -> CONSUMED]
+    L -->|Cancel / terminal failure| N[Atomically HELD -> RELEASED]
+    L -->|Lease heartbeat| O[Extend reservation expiry]
+    P[Reservation sweeper] -->|Expired, non-running only| N
+    M --> Q[Immutable usage event + audit/SIEM export]
+    N --> Q
