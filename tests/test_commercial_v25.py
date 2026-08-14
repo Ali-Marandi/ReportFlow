@@ -121,3 +121,38 @@ def test_usage_metadata_rejects_recipient_identity_or_credentials(catalog):
     catalog.assign_tenant("tenant-alpha", "growth-v1", 1)
     with pytest.raises(ReportFlowError, match="recipient identity"):
         catalog.record_usage("tenant-alpha", "portal_view", 1, "portal-view-001", "2026-08", metadata={"email": "person@example.test"})
+
+
+def test_usage_event_captures_plan_snapshot_across_tenant_upgrade(catalog, store):
+    catalog.assign_tenant("tenant-alpha", "growth-v1", 1)
+    original = catalog.record_usage("tenant-alpha", "successful_delivery", 1, "snapshot-event-001", "2026-08")
+    catalog.save_plan(
+        CommercialPlan(
+            id="growth-v1",
+            version=2,
+            display_name="Growth v2",
+            feature_flags=("distribution_queue", "white_label_portal", "lineage_impact", "governance_approval"),
+            meter_limits={"successful_delivery": 5, "portal_view": 30},
+            overage_behavior="deny",
+            commercial_sku="rf-growth-monthly-v2",
+            created_at="",
+        )
+    )
+    catalog.assign_tenant("tenant-alpha", "growth-v1", 2)
+    upgraded = catalog.record_usage("tenant-alpha", "successful_delivery", 1, "snapshot-event-002", "2026-08")
+
+    assert (original.plan_id, original.plan_version) == ("growth-v1", 1)
+    assert (upgraded.plan_id, upgraded.plan_version) == ("growth-v1", 2)
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT id,plan_id,plan_version,entitlement_effective_from FROM commercial_usage_events ORDER BY occurred_at"
+        ).fetchall()
+    assert {(row["plan_id"], row["plan_version"]) for row in rows} == {("growth-v1", 1), ("growth-v1", 2)}
+    assert all(row["entitlement_effective_from"] for row in rows)
+
+
+@pytest.mark.parametrize("metadata", [{"recipient_id": "cust-1"}, {"contactPhone": "+1-555-0100"}, {"nested": {"apiToken": "redacted"}}])
+def test_usage_metadata_rejects_common_identity_and_credential_key_variants(catalog, metadata):
+    catalog.assign_tenant("tenant-alpha", "growth-v1", 1)
+    with pytest.raises(ReportFlowError, match="recipient identity"):
+        catalog.record_usage("tenant-alpha", "portal_view", 1, f"metadata-safe-{len(str(metadata))}", "2026-08", metadata=metadata)
