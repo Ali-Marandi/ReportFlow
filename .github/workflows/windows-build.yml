@@ -45,7 +45,10 @@ jobs:
         run: pip-audit -r requirements.txt
 
       - name: Build SBOM
-        run: cyclonedx-py environment --output-file dist/sbom.json
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          cyclonedx-py environment --output-file dist/sbom.json
 
       - name: Package ReportFlow Desktop
         run: |
