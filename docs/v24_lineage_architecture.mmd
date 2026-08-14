@@ -1,0 +1,16 @@
+flowchart LR
+  D[Dataset] --> F[Dataset Field]
+  F --> M[Certified Metric]
+  F --> X[Dimension]
+  M --> S[Semantic Model]
+  X --> S
+  S --> R[Report]
+  R --> B[Burst Definition]
+  B --> T[Governed Destination]
+  R --> A[Export Artifact]
+  A --> T
+  G[Approval Policy] -. authorizes .-> B
+  L[Tamper-evident Ledger] -. records .-> G
+  I[Impact Analysis] -. traverses .-> D
+  I -. identifies .-> R
+  I -. identifies .-> T
