@@ -32,13 +32,14 @@ def test_queue_idempotency_retry_and_dead_letter(tmp_path: Path) -> None:
     job, created = queue.enqueue("artifact_delivery", {"destination_id": "s3-prod", "artifact_path": "/exports/a.pdf"}, "burst-2026-08-14-0001", retry_policy=policy)
     duplicate, duplicate_created = queue.enqueue("artifact_delivery", {"destination_id": "s3-prod", "artifact_path": "/exports/a.pdf"}, "burst-2026-08-14-0001", retry_policy=policy)
     assert created and not duplicate_created and duplicate.id == job.id
-    first = queue.claim_next("worker-a", now=datetime(2026, 8, 14, 8, 0, tzinfo=UTC))
+    start = datetime.now(UTC) + timedelta(seconds=1)
+    first = queue.claim_next("worker-a", now=start)
     assert first and first.job.attempt_count == 1
-    retry = queue.fail(first, "temporary storage outage", retryable=True, now=datetime(2026, 8, 14, 8, 0, tzinfo=UTC))
-    assert retry.status == "retry" and retry.available_at == "2026-08-14T08:00:10+00:00"
-    second = queue.claim_next("worker-a", now=datetime(2026, 8, 14, 8, 0, 10, tzinfo=UTC))
+    retry = queue.fail(first, "temporary storage outage", retryable=True, now=start)
+    assert retry.status == "retry" and retry.available_at == (start + timedelta(seconds=10)).isoformat()
+    second = queue.claim_next("worker-a", now=start + timedelta(seconds=10))
     assert second and second.job.attempt_count == 2
-    dlq = queue.fail(second, "authorization rejected", retryable=False, now=datetime(2026, 8, 14, 8, 0, 10, tzinfo=UTC))
+    dlq = queue.fail(second, "authorization rejected", retryable=False, now=start + timedelta(seconds=10))
     assert dlq.status == "dead_letter"
 
 
