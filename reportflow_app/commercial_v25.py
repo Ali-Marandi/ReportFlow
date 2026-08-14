@@ -86,6 +86,9 @@ class UsageEvent:
     quantity: int
     idempotency_key: str
     billing_period: str
+    plan_id: str
+    plan_version: int
+    entitlement_effective_from: str
     overage_units: int
     metadata: dict[str, Any]
     occurred_at: str
@@ -143,6 +146,9 @@ class CommercialCatalog:
                     quantity INTEGER NOT NULL CHECK(quantity > 0),
                     idempotency_key TEXT NOT NULL UNIQUE,
                     billing_period TEXT NOT NULL,
+                    plan_id TEXT NOT NULL DEFAULT '',
+                    plan_version INTEGER NOT NULL DEFAULT 0,
+                    entitlement_effective_from TEXT NOT NULL DEFAULT '',
                     overage_units INTEGER NOT NULL CHECK(overage_units >= 0),
                     metadata TEXT NOT NULL,
                     occurred_at TEXT NOT NULL
@@ -151,6 +157,15 @@ class CommercialCatalog:
                     ON commercial_usage_events(tenant_id, meter, billing_period);
                 """
             )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(commercial_usage_events)").fetchall()}
+            migrations = {
+                "plan_id": "ALTER TABLE commercial_usage_events ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''",
+                "plan_version": "ALTER TABLE commercial_usage_events ADD COLUMN plan_version INTEGER NOT NULL DEFAULT 0",
+                "entitlement_effective_from": "ALTER TABLE commercial_usage_events ADD COLUMN entitlement_effective_from TEXT NOT NULL DEFAULT ''",
+            }
+            for column, statement in migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
 
     def save_plan(self, plan: CommercialPlan, *, actor: str = "commercial-admin") -> CommercialPlan:
         plan.validate()
@@ -298,13 +313,16 @@ class CommercialCatalog:
                 }, actor=actor)
                 raise ReportFlowError("Usage would exceed the tenant plan limit.")
             event_id, now = str(uuid4()), utc_now()
-            event = UsageEvent(event_id, tenant_id, meter, quantity, idempotency_key, billing_period,
-                               max(0, projected - limit) - max(0, used - limit), safe_metadata, now)
+            event = UsageEvent(event_id, tenant_id, meter, quantity, idempotency_key, billing_period, plan.id, plan.version,
+                               entitlement.effective_from, max(0, projected - limit) - max(0, used - limit), safe_metadata, now)
             connection.execute(
-                """INSERT INTO commercial_usage_events(id,tenant_id,meter,quantity,idempotency_key,billing_period,overage_units,metadata,occurred_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO commercial_usage_events(
+                    id,tenant_id,meter,quantity,idempotency_key,billing_period,plan_id,plan_version,entitlement_effective_from,
+                    overage_units,metadata,occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (event.id, event.tenant_id, event.meter, event.quantity, event.idempotency_key, event.billing_period,
-                 event.overage_units, _canonical_json(event.metadata), event.occurred_at),
+                 event.plan_id, event.plan_version, event.entitlement_effective_from, event.overage_units,
+                 _canonical_json(event.metadata), event.occurred_at),
             )
             connection.commit()
         self.store.audit("commercial.usage_recorded", "usage_event", event.id, {
@@ -351,7 +369,8 @@ class CommercialCatalog:
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> UsageEvent:
         return UsageEvent(str(row["id"]), str(row["tenant_id"]), str(row["meter"]), int(row["quantity"]),
-                          str(row["idempotency_key"]), str(row["billing_period"]), int(row["overage_units"]),
+                          str(row["idempotency_key"]), str(row["billing_period"]), str(row["plan_id"]),
+                          int(row["plan_version"]), str(row["entitlement_effective_from"]), int(row["overage_units"]),
                           json.loads(row["metadata"]), str(row["occurred_at"]))
 
 
@@ -400,8 +419,11 @@ def _safe_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ReportFlowError("Usage metadata must be JSON-serializable without non-finite values.") from error
     if len(_canonical_json(copied).encode("utf-8")) > 16_000:
         raise ReportFlowError("Usage metadata exceeds the 16 KiB limit.")
-    blocked = {"password", "secret", "token", "access_key", "private_key", "email"}
-    if any(str(key).lower() in blocked for key in _walk_keys(copied)):
+    blocked_fragments = (
+        "password", "secret", "token", "access_key", "private_key", "email", "phone", "recipient",
+        "customer_name", "first_name", "last_name", "address",
+    )
+    if any(fragment in str(key).lower() for key in _walk_keys(copied) for fragment in blocked_fragments):
         raise ReportFlowError("Usage metadata cannot contain credentials or recipient identity.")
     return copied
 
