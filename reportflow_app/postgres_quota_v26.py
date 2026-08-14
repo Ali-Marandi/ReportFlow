@@ -12,7 +12,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Protocol
 from uuid import UUID
 
 from psycopg import Connection, connect
@@ -82,6 +82,21 @@ class OutboxLease:
     aggregate_id: UUID
     payload: dict[str, Any]
     lease_token: UUID
+    lease_owner: str
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxRunResult:
+    claimed: int
+    published: int
+    deferred: int
+
+
+class OutboxSink(Protocol):
+    """Broker adapter. Consumers must deduplicate by the supplied idempotency key."""
+
+    def publish(self, event_type: str, payload: Mapping[str, Any], *, idempotency_key: str) -> None:
+        """Publish a durable event or raise a recoverable exception."""
 
 
 class QuotaExceeded(ReportFlowError):
@@ -363,7 +378,12 @@ class PostgresQuotaReservationService:
             return True
 
     def claim_outbox(self, publisher_id: str, *, batch_size: int = 25, lease_seconds: int = 60) -> list[OutboxLease]:
-        """Lease unpublished events with SKIP LOCKED; publishing remains at-least-once by design."""
+        """Lease ready events without blocking competing publishers.
+
+        `FOR UPDATE SKIP LOCKED` means two publisher processes claim disjoint rows instead
+        of waiting behind the same oldest event. Leases expire to recover from publisher
+        crashes; broker consumers must still deduplicate because publication is at-least-once.
+        """
         _validate_id(publisher_id, "Publisher ID")
         if not 1 <= batch_size <= 500 or not 10 <= lease_seconds <= 3_600:
             raise ReportFlowError("Outbox batch or lease setting is invalid.")
@@ -373,39 +393,74 @@ class PostgresQuotaReservationService:
                 WITH candidates AS (
                     SELECT id FROM rf_outbox_events
                     WHERE published_at IS NULL
+                      AND available_at <= now()
                       AND (lease_expires_at IS NULL OR lease_expires_at < now())
-                    ORDER BY occurred_at ASC
+                    ORDER BY available_at ASC, occurred_at ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
                 UPDATE rf_outbox_events e
                 SET lease_token=gen_random_uuid(),
+                    lease_owner=%s,
                     lease_expires_at=now() + (%s * interval '1 second'),
                     publish_attempts=publish_attempts+1
                 FROM candidates
                 WHERE e.id=candidates.id
-                RETURNING e.id,e.event_type,e.aggregate_id,e.payload,e.lease_token
+                RETURNING e.id,e.event_type,e.aggregate_id,e.payload,e.lease_token,e.lease_owner
                 """,
-                (batch_size, lease_seconds),
+                (batch_size, publisher_id, lease_seconds),
             ).fetchall()
             return [
-                OutboxLease(UUID(str(row["id"])), str(row["event_type"]), UUID(str(row["aggregate_id"])), dict(row["payload"]), UUID(str(row["lease_token"])))
+                OutboxLease(
+                    UUID(str(row["id"])), str(row["event_type"]), UUID(str(row["aggregate_id"])),
+                    dict(row["payload"]), UUID(str(row["lease_token"])), str(row["lease_owner"]),
+                )
                 for row in rows
             ]
 
-    def mark_outbox_published(self, event_id: UUID, lease_token: UUID) -> None:
-        """Acknowledge a published event only if this publisher owns the active lease."""
+    def mark_outbox_published(self, event_id: UUID, lease_token: UUID, publisher_id: str) -> None:
+        """Acknowledge publication only if this publisher still owns the active lease."""
+        _validate_id(str(event_id), "Outbox event ID")
+        _validate_id(str(lease_token), "Outbox lease token")
+        _validate_id(publisher_id, "Publisher ID")
         with self._connection() as connection, connection.transaction():
             updated = connection.execute(
                 """
                 UPDATE rf_outbox_events
-                SET published_at=now(), lease_token=NULL, lease_expires_at=NULL, last_error=''
-                WHERE id=%s AND published_at IS NULL AND lease_token=%s
+                SET published_at=now(), lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL, last_error=''
+                WHERE id=%s AND published_at IS NULL AND lease_token=%s AND lease_owner=%s
+                  AND lease_expires_at >= now()
                 """,
-                (event_id, lease_token),
+                (event_id, lease_token, publisher_id),
             ).rowcount
             if updated != 1:
                 raise ReportFlowError("Outbox acknowledgement was rejected because its lease is invalid.")
+
+    def defer_outbox(self, event_id: UUID, lease_token: UUID, publisher_id: str, error: Exception | str, *, retry_seconds: int) -> None:
+        """Release a failed event for a bounded delayed retry without losing its history."""
+        _validate_id(str(event_id), "Outbox event ID")
+        _validate_id(str(lease_token), "Outbox lease token")
+        _validate_id(publisher_id, "Publisher ID")
+        if not 1 <= retry_seconds <= 3_600:
+            raise ReportFlowError("Outbox retry delay is invalid.")
+        safe_error = _safe_outbox_error(error)
+        with self._connection() as connection, connection.transaction():
+            updated = connection.execute(
+                """
+                UPDATE rf_outbox_events
+                SET available_at=now() + (%s * interval '1 second'),
+                    lease_token=NULL,
+                    lease_owner=NULL,
+                    lease_expires_at=NULL,
+                    last_error=%s
+                WHERE id=%s AND published_at IS NULL AND lease_token=%s AND lease_owner=%s
+                  AND lease_expires_at >= now()
+                """,
+                (retry_seconds, safe_error, event_id, lease_token, publisher_id),
+            ).rowcount
+            if updated != 1:
+                raise ReportFlowError("Outbox retry update was rejected because its lease is invalid.")
+
 
     def _lock_or_create_bucket(self, connection: Connection[Any], grant: QuotaGrant) -> Mapping[str, Any]:
         connection.execute(
@@ -506,6 +561,64 @@ class PostgresQuotaReservationService:
             raise ReportFlowError("Distribution payload must be JSON serializable.") from error
         if len(encoded) > 128_000:
             raise ReportFlowError("Distribution payload exceeds the sample control-plane limit.")
+
+
+
+class TransactionalOutboxWorker:
+    """A one-pass, deterministic worker suitable for a durable supervisor or scheduled runtime.
+
+    The worker never sleeps, polls, or owns a long-lived database connection. A deployment
+    supervisor controls cadence. This keeps work bounded and lets multiple replicas run
+    concurrently; PostgreSQL leases and SKIP LOCKED coordinate their claims.
+    """
+
+    def __init__(
+        self,
+        service: PostgresQuotaReservationService,
+        sink: OutboxSink,
+        *,
+        publisher_id: str,
+        batch_size: int = 25,
+        lease_seconds: int = 60,
+        retry_seconds: int = 30,
+    ) -> None:
+        _validate_id(publisher_id, "Publisher ID")
+        if not 1 <= batch_size <= 500 or not 10 <= lease_seconds <= 3_600 or not 1 <= retry_seconds <= 3_600:
+            raise ReportFlowError("Outbox worker settings are invalid.")
+        self.service = service
+        self.sink = sink
+        self.publisher_id = publisher_id
+        self.batch_size = batch_size
+        self.lease_seconds = lease_seconds
+        self.retry_seconds = retry_seconds
+
+    def run_once(self) -> OutboxRunResult:
+        """Publish one lease-safe batch and return counts suitable for metrics/logs."""
+        leases = self.service.claim_outbox(
+            self.publisher_id, batch_size=self.batch_size, lease_seconds=self.lease_seconds
+        )
+        published = deferred = 0
+        for event in leases:
+            try:
+                self.sink.publish(event.event_type, event.payload, idempotency_key=str(event.event_id))
+                self.service.mark_outbox_published(event.event_id, event.lease_token, self.publisher_id)
+                published += 1
+            except Exception as error:  # A sink failure must preserve the durable outbox event.
+                try:
+                    self.service.defer_outbox(
+                        event.event_id, event.lease_token, self.publisher_id, error, retry_seconds=self.retry_seconds
+                    )
+                except ReportFlowError:
+                    # The lease can expire after broker publication and before acknowledgement.
+                    # Do not stop the batch: the event remains durable and its consumer must deduplicate.
+                    pass
+                deferred += 1
+        return OutboxRunResult(claimed=len(leases), published=published, deferred=deferred)
+
+
+def _safe_outbox_error(error: Exception | str) -> str:
+    text = str(error).replace("\n", " ").replace("\r", " ").strip()
+    return text[:500] or "outbox_publish_failed"
 
 
 def _validate_id(value: str, label: str) -> None:
