@@ -9,10 +9,11 @@ Dependency: psycopg[binary]>=3.1 from requirements-enterprise.txt
 from __future__ import annotations
 
 import json
+import random
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Callable, Literal, Mapping, Protocol
 from uuid import UUID
 
 from psycopg import Connection, connect
@@ -83,6 +84,30 @@ class OutboxLease:
     payload: dict[str, Any]
     lease_token: UUID
     lease_owner: str
+    publish_attempts: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ExponentialBackoffPolicy:
+    """Full-jitter retry policy; delay is uniform in [0, capped exponential delay]."""
+
+    max_attempts: int = 5
+    base_delay_seconds: int = 2
+    max_delay_seconds: int = 300
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_attempts <= 100:
+            raise ReportFlowError("Outbox max attempts is invalid.")
+        if not 1 <= self.base_delay_seconds <= self.max_delay_seconds <= 86_400:
+            raise ReportFlowError("Outbox retry delay policy is invalid.")
+
+    def retry_delay_seconds(self, publish_attempts: int, *, random_value: float) -> int:
+        if not 1 <= publish_attempts < self.max_attempts:
+            raise ReportFlowError("Outbox retry is not permitted after the maximum attempt.")
+        if not 0.0 <= random_value < 1.0:
+            raise ReportFlowError("Outbox jitter value is invalid.")
+        cap = min(self.max_delay_seconds, self.base_delay_seconds * (2 ** (publish_attempts - 1)))
+        return max(1, int(random_value * cap) + 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +115,7 @@ class OutboxRunResult:
     claimed: int
     published: int
     deferred: int
+    dead_lettered: int
 
 
 class OutboxSink(Protocol):
@@ -393,6 +419,7 @@ class PostgresQuotaReservationService:
                 WITH candidates AS (
                     SELECT id FROM rf_outbox_events
                     WHERE published_at IS NULL
+                      AND dead_lettered_at IS NULL
                       AND available_at <= now()
                       AND (lease_expires_at IS NULL OR lease_expires_at < now())
                     ORDER BY available_at ASC, occurred_at ASC
@@ -406,14 +433,14 @@ class PostgresQuotaReservationService:
                     publish_attempts=publish_attempts+1
                 FROM candidates
                 WHERE e.id=candidates.id
-                RETURNING e.id,e.event_type,e.aggregate_id,e.payload,e.lease_token,e.lease_owner
+                RETURNING e.id,e.event_type,e.aggregate_id,e.payload,e.lease_token,e.lease_owner,e.publish_attempts
                 """,
                 (batch_size, publisher_id, lease_seconds),
             ).fetchall()
             return [
                 OutboxLease(
                     UUID(str(row["id"])), str(row["event_type"]), UUID(str(row["aggregate_id"])),
-                    dict(row["payload"]), UUID(str(row["lease_token"])), str(row["lease_owner"]),
+                    dict(row["payload"]), UUID(str(row["lease_token"])), str(row["lease_owner"]), int(row["publish_attempts"]),
                 )
                 for row in rows
             ]
@@ -460,6 +487,35 @@ class PostgresQuotaReservationService:
             ).rowcount
             if updated != 1:
                 raise ReportFlowError("Outbox retry update was rejected because its lease is invalid.")
+
+    def dead_letter_outbox(self, event_id: UUID, lease_token: UUID, publisher_id: str, error: Exception | str) -> None:
+        """Move an exhausted event to terminal DLQ while preserving its payload and attempt history."""
+        _validate_id(str(event_id), "Outbox event ID")
+        _validate_id(str(lease_token), "Outbox lease token")
+        _validate_id(publisher_id, "Publisher ID")
+        safe_error = _safe_outbox_error(error)
+        with self._connection() as connection, connection.transaction():
+            updated = connection.execute(
+                """
+                UPDATE rf_outbox_events
+                SET dead_lettered_at=now(),
+                    dead_letter_reason=%s,
+                    dead_lettered_by=%s,
+                    lease_token=NULL,
+                    lease_owner=NULL,
+                    lease_expires_at=NULL,
+                    last_error=%s
+                WHERE id=%s
+                  AND published_at IS NULL
+                  AND dead_lettered_at IS NULL
+                  AND lease_token=%s
+                  AND lease_owner=%s
+                  AND lease_expires_at >= now()
+                """,
+                (safe_error, publisher_id, safe_error, event_id, lease_token, publisher_id),
+            ).rowcount
+            if updated != 1:
+                raise ReportFlowError("Outbox DLQ transition was rejected because its lease is invalid.")
 
 
     def _lock_or_create_bucket(self, connection: Connection[Any], grant: QuotaGrant) -> Mapping[str, Any]:
@@ -580,24 +636,32 @@ class TransactionalOutboxWorker:
         publisher_id: str,
         batch_size: int = 25,
         lease_seconds: int = 60,
-        retry_seconds: int = 30,
+        retry_policy: ExponentialBackoffPolicy | None = None,
+        retry_seconds: int | None = None,
+        random_value: Callable[[], float] = random.random,
     ) -> None:
         _validate_id(publisher_id, "Publisher ID")
-        if not 1 <= batch_size <= 500 or not 10 <= lease_seconds <= 3_600 or not 1 <= retry_seconds <= 3_600:
+        if not 1 <= batch_size <= 500 or not 10 <= lease_seconds <= 3_600:
             raise ReportFlowError("Outbox worker settings are invalid.")
+        if retry_policy is not None and retry_seconds is not None:
+            raise ReportFlowError("Choose either a retry policy or legacy fixed retry seconds.")
+        if retry_seconds is not None and not 1 <= retry_seconds <= 3_600:
+            raise ReportFlowError("Outbox legacy retry delay is invalid.")
         self.service = service
         self.sink = sink
         self.publisher_id = publisher_id
         self.batch_size = batch_size
         self.lease_seconds = lease_seconds
-        self.retry_seconds = retry_seconds
+        self.retry_policy = retry_policy or ExponentialBackoffPolicy()
+        self.legacy_retry_seconds = retry_seconds
+        self.random_value = random_value
 
     def run_once(self) -> OutboxRunResult:
-        """Publish one lease-safe batch and return counts suitable for metrics/logs."""
+        """Publish one lease-safe batch with full-jitter retries and terminal DLQ state."""
         leases = self.service.claim_outbox(
             self.publisher_id, batch_size=self.batch_size, lease_seconds=self.lease_seconds
         )
-        published = deferred = 0
+        published = deferred = dead_lettered = 0
         for event in leases:
             try:
                 self.sink.publish(event.event_type, event.payload, idempotency_key=str(event.event_id))
@@ -605,15 +669,24 @@ class TransactionalOutboxWorker:
                 published += 1
             except Exception as error:  # A sink failure must preserve the durable outbox event.
                 try:
-                    self.service.defer_outbox(
-                        event.event_id, event.lease_token, self.publisher_id, error, retry_seconds=self.retry_seconds
-                    )
+                    if event.publish_attempts >= self.retry_policy.max_attempts:
+                        self.service.dead_letter_outbox(event.event_id, event.lease_token, self.publisher_id, error)
+                        dead_lettered += 1
+                    else:
+                        delay = self.legacy_retry_seconds or self.retry_policy.retry_delay_seconds(
+                            event.publish_attempts, random_value=self.random_value()
+                        )
+                        self.service.defer_outbox(
+                            event.event_id, event.lease_token, self.publisher_id, error, retry_seconds=delay
+                        )
+                        deferred += 1
                 except ReportFlowError:
                     # The lease can expire after broker publication and before acknowledgement.
                     # Do not stop the batch: the event remains durable and its consumer must deduplicate.
                     pass
-                deferred += 1
-        return OutboxRunResult(claimed=len(leases), published=published, deferred=deferred)
+        return OutboxRunResult(
+            claimed=len(leases), published=published, deferred=deferred, dead_lettered=dead_lettered
+        )
 
 
 def _safe_outbox_error(error: Exception | str) -> str:
