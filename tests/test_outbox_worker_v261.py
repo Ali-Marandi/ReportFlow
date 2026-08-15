@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from reportflow_app.core import ReportFlowError
-from reportflow_app.postgres_quota_v26 import OutboxLease, TransactionalOutboxWorker
+from reportflow_app.postgres_quota_v26 import ExponentialBackoffPolicy, OutboxLease, TransactionalOutboxWorker
 
 
 class FakeService:
@@ -12,6 +12,7 @@ class FakeService:
         self.claim_calls = []
         self.published = []
         self.deferred = []
+        self.dead_lettered = []
 
     def claim_outbox(self, publisher_id, *, batch_size, lease_seconds):
         self.claim_calls.append((publisher_id, batch_size, lease_seconds))
@@ -22,6 +23,9 @@ class FakeService:
 
     def defer_outbox(self, event_id, lease_token, publisher_id, error, *, retry_seconds):
         self.deferred.append((event_id, lease_token, publisher_id, str(error), retry_seconds))
+
+    def dead_letter_outbox(self, event_id, lease_token, publisher_id, error):
+        self.dead_lettered.append((event_id, lease_token, publisher_id, str(error)))
 
 
 class FakeSink:
@@ -35,9 +39,11 @@ class FakeSink:
         self.published.append((event_type, dict(payload), idempotency_key))
 
 
-def _event(event_type="distribution.admitted"):
+def _event(event_type="distribution.admitted", *, publish_attempts=1):
     event_id = uuid4()
-    return OutboxLease(event_id, event_type, uuid4(), {"job_id": "job-001"}, uuid4(), "outbox-publisher-1")
+    return OutboxLease(
+        event_id, event_type, uuid4(), {"job_id": "job-001"}, uuid4(), "outbox-publisher-1", publish_attempts
+    )
 
 
 def test_worker_claims_and_acknowledges_each_successful_event_with_event_id_dedupe():
@@ -63,7 +69,7 @@ def test_worker_defers_failed_event_but_continues_to_publish_later_events():
 
     result = worker.run_once()
 
-    assert (result.claimed, result.published, result.deferred) == (2, 1, 1)
+    assert (result.claimed, result.published, result.deferred, result.dead_lettered) == (2, 1, 1, 0)
     assert service.deferred == [(failed.event_id, failed.lease_token, "outbox-publisher-1", "broker temporarily unavailable", 45)]
     assert service.published == [(successful.event_id, successful.lease_token, "outbox-publisher-1")]
 
@@ -81,5 +87,30 @@ def test_worker_keeps_batch_live_when_lease_is_lost_before_retry_transition():
 
     result = worker.run_once()
 
-    assert (result.claimed, result.published, result.deferred) == (2, 1, 1)
+    assert (result.claimed, result.published, result.deferred, result.dead_lettered) == (2, 1, 0, 0)
     assert service.published == [(successful.event_id, successful.lease_token, "outbox-publisher-1")]
+
+
+def test_full_jitter_backoff_is_bounded_by_exponential_cap():
+    policy = ExponentialBackoffPolicy(max_attempts=5, base_delay_seconds=2, max_delay_seconds=10)
+
+    assert policy.retry_delay_seconds(1, random_value=0.0) == 1
+    assert policy.retry_delay_seconds(2, random_value=0.5) == 3
+    assert policy.retry_delay_seconds(4, random_value=0.999) == 10
+
+
+def test_worker_moves_exhausted_event_to_dead_letter_queue():
+    event = _event(publish_attempts=3)
+    service = FakeService([event])
+    sink = FakeSink({str(event.event_id)})
+    worker = TransactionalOutboxWorker(
+        service, sink, publisher_id="outbox-publisher-1", retry_policy=ExponentialBackoffPolicy(max_attempts=3)
+    )
+
+    result = worker.run_once()
+
+    assert (result.claimed, result.published, result.deferred, result.dead_lettered) == (1, 0, 0, 1)
+    assert service.deferred == []
+    assert service.dead_lettered == [
+        (event.event_id, event.lease_token, "outbox-publisher-1", "broker temporarily unavailable")
+    ]

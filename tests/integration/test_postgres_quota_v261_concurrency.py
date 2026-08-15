@@ -37,6 +37,7 @@ def clean_schema(postgres_dsn: str):
     migrations = [
         root / "migrations/postgres/001_v26_atomic_quota_reservation.sql",
         root / "migrations/postgres/002_v261_outbox_worker_leases.sql",
+        root / "migrations/postgres/003_v27_outbox_dead_letter.sql",
     ]
     with connect(postgres_dsn, autocommit=True) as connection:
         for migration in migrations:
@@ -149,3 +150,22 @@ def test_parallel_outbox_claims_are_disjoint_and_cover_every_ready_event(postgre
             "SELECT count(*) AS count FROM rf_outbox_events WHERE published_at IS NULL AND lease_owner IS NOT NULL"
         ).fetchone()
     assert int(leased["count"]) == 12
+
+
+def test_dead_letter_event_is_terminal_and_excluded_from_future_claims(postgres_dsn: str):
+    service = PostgresQuotaReservationService(postgres_dsn)
+    service.admit(_request("terminal-dlq-001", included_units=5))
+    lease = service.claim_outbox("outbox-publisher-dlq", batch_size=1, lease_seconds=60)[0]
+
+    service.dead_letter_outbox(lease.event_id, lease.lease_token, "outbox-publisher-dlq", "permanent broker rejection")
+
+    assert service.claim_outbox("outbox-publisher-next", batch_size=1, lease_seconds=60) == []
+    with connect(postgres_dsn, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT dead_lettered_at,dead_letter_reason,dead_lettered_by,published_at FROM rf_outbox_events WHERE id=%s",
+            (lease.event_id,),
+        ).fetchone()
+    assert row["dead_lettered_at"] is not None
+    assert row["dead_letter_reason"] == "permanent broker rejection"
+    assert row["dead_lettered_by"] == "outbox-publisher-dlq"
+    assert row["published_at"] is None
